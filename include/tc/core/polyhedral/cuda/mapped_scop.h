@@ -157,13 +157,10 @@ class MappedScop {
   detail::ScheduleTree* separateReduction(detail::ScheduleTree* band);
   // Insert reduction synchronizations.
   void insertReductionSyncs();
-  // Map "band" to thread identifiers, assuming "nInner" thread identifiers
-  // have already been used and using as many remaining blockSizes values as
-  // outer coincident dimensions,
-  // unroll band members that execute at most "unroll" instances
-  // (if nInner == 0) and
-  // return the updated number of mapped thread identifiers.
-  size_t mapToThreads(detail::ScheduleTree* band, size_t nInner);
+  // Map "band" to thread identifiers using as many blockSizes values as outer
+  // coincident dimensions, unroll band members that execute at most "unroll"
+  // instances and return the number of mapped thread identifiers.
+  size_t mapToThreads(detail::ScheduleTree* band);
   // Map innermost bands to thread identifiers and
   // return the number of mapped thread identifiers.
   size_t mapInnermostBandsToThreads(detail::ScheduleTree* st);

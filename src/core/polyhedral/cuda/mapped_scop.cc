@@ -87,10 +87,6 @@ isl::union_set makeFixRemainingZeroFilter(
   auto filter = makeParameterContext(space, idExtents.begin(), idExtents.end());
   return filter & activeDomain.universe();
 }
-
-bool anyNonCoincidentMember(const detail::ScheduleTreeElemBand* band) {
-  return band->nOuterCoincident() < band->nMember();
-}
 } // namespace
 
 template <typename MappingTypeId>
@@ -311,62 +307,49 @@ detail::ScheduleTree* MappedScop::separateReduction(detail::ScheduleTree* st) {
   return st->ancestor(root, 2);
 }
 
-size_t MappedScop::mapToThreads(detail::ScheduleTree* band, size_t nInner) {
+size_t MappedScop::mapToThreads(detail::ScheduleTree* band) {
   using namespace tc::polyhedral::detail;
-
-  if (nInner >= numThreads.view.size()) {
-    return nInner;
-  }
 
   bool mapReduction = reductionBandUpdates_.count(band) == 1;
   if (mapReduction) {
     // A reduction is assumed to get mapped to threadIdx.x
-    if (nInner != 0) {
-      reductionBandUpdates_.erase(band);
-      return nInner;
-    }
     CHECK(reductionBandUpdates_.at(band).separated);
     threadIdxxScheduleDepthState.emplace_back(std::make_pair(
         activeDomainPoints(schedule(), band),
         band->scheduleDepth(schedule()) + 0));
     auto reductionDim = reductionBandUpdates_.at(band).reductionDim;
     band = map(band, reductionDim, mapping::ThreadId::x());
-    markUnroll(scop_->scheduleRoot(), band, unroll);
-    return 1;
   }
+
   auto bandNode = band->elemAs<ScheduleTreeElemBand>();
-  // If any inner node was mapped to threads and
-  // the current node has a non-coincident member,
-  // then synchronization needs to be introduced.
-  // This also implies that the mapping needs to be completed first.
-  if (anyNonCoincidentMember(bandNode) && nInner > 0) {
-    // Since some thread identifiers were mapped already (nInner > 0),
-    // the band should have descendants.  Double check.
-    CHECK_EQ(band->numChildren(), 1);
-    mapRemaining<mapping::ThreadId>(
-        band->child({0}), nInner, numThreads.view.size());
-    scop_->insertSyncAfter(band->child({0}));
-    return numThreads.view.size();
-  }
   // With current isl scheduler, if coincident dimensions exist in a band,
   // they are outermost.
   // If a band has more than 3 coincident dimensions, this will choose
   // outermost, but we may also want innermost.
   auto nOuterCoincident = bandNode->nOuterCoincident();
+  int firstThreadIndex = mapReduction ? 1 : 0;
   if (!bandNode->permutable_ || nOuterCoincident < 1) {
-    return nInner;
+    return firstThreadIndex;
   }
 
   auto nMappedThreads = std::min(
-      numThreads.view.size() - nInner, static_cast<size_t>(nOuterCoincident));
-  CHECK_GT(nMappedThreads, 0) << "not mapping to threads";
-  CHECK_LE(nMappedThreads, 3 - nInner) << "mapping to too many threads";
+      numThreads.view.size() - firstThreadIndex,
+      static_cast<size_t>(nOuterCoincident));
+
+  // Immediately return if mapping to one thread dimension only was requested
+  // and a reduction was already mapped.  (Note that reduction is detected only
+  // if there are no outer coincident dimensions in the same band).
+  if (nMappedThreads == 0) {
+    return firstThreadIndex;
+  }
+  CHECK_LE(nMappedThreads, 3 - firstThreadIndex)
+      << "mapping to too many threads";
 
   // Map the coincident dimensions to threads starting from the innermost and
-  // from thread x.
+  // from thread x unless it was already mapped to a reduction.
   for (int i = 0, dim = nOuterCoincident - 1; i < nMappedThreads && dim >= 0;
        ++i, --dim) {
-    auto id = mapping::ThreadId::makeId(nInner + i);
+    auto id = mapping::ThreadId::makeId(firstThreadIndex + i);
     if (id == mapping::ThreadId::x()) {
       threadIdxxScheduleDepthState.emplace_back(std::make_pair(
           activeDomainPoints(schedule(), band),
@@ -375,11 +358,7 @@ size_t MappedScop::mapToThreads(detail::ScheduleTree* band, size_t nInner) {
     band = map(band, dim, id);
   }
 
-  if (nInner == 0) {
-    markUnroll(scop_->scheduleRoot(), band, unroll);
-  }
-
-  return nInner + nMappedThreads;
+  return firstThreadIndex + nMappedThreads;
 }
 
 namespace {
@@ -409,8 +388,12 @@ bool hasOuterSequentialMember(
 }
 } // namespace
 
-// Maps bands to threads in DFS postorder, keeping track of
-// the (maximal) number of threads already mapped by descendants.
+// Maps bands to threads in DFS postorder.
+// Mapping is only allowed if descendants are not already mapped to threads.
+// Mapping nested bands to threads is invalid because members of those bands
+// are not necessarily permutable, and there is no guaranteed nesting between
+// thread dimensions (e.g., there is no guarantee that all threads with
+// threadIdx.y=0 will be executed before any thread with threadIdx.y=1).
 //
 // If any separation is needed for mapping reductions to full blocks,
 // then do so first.
@@ -462,8 +445,10 @@ size_t MappedScop::mapInnermostBandsToThreads(detail::ScheduleTree* st) {
     }
   }
 
-  if (st->elemAs<detail::ScheduleTreeElemBand>()) {
-    n = mapToThreads(st, n);
+  if (n == 0 && st->elemAs<detail::ScheduleTreeElemBand>()) {
+    auto nMapped = mapToThreads(st);
+    markUnroll(scop_->scheduleRoot(), st, unroll);
+    return nMapped;
   }
 
   return n;
