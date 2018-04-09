@@ -220,7 +220,6 @@ bool MappedScop::detectReductions(detail::ScheduleTree* tree) {
   if (reductionDim != nCoincident) {
     return false;
   }
-  auto reductionTree = bandSplitOut(scop_->scheduleRoot(), tree, reductionDim);
   // Order the init statements (if any) before the update statements
   // to ensure the band from which the reduction band has been split off
   // only contains update statements.
@@ -228,57 +227,43 @@ bool MappedScop::detectReductions(detail::ScheduleTree* tree) {
   if (!inits.is_empty()) {
     orderBefore(scop_->scheduleRoot(), tree, inits);
   }
-  reductionFromParent_.emplace(tree, reductionTree);
-  reductionBandUpdates_.emplace(reductionTree, updates);
+  reductionBandUpdates_.emplace(tree, Reduction(updates, reductionDim));
   return true;
 }
 
 bool MappedScop::needReductionSeparation(const detail::ScheduleTree* st) {
-  // It is the parent band of the reduction band that needs to be separated.
-  if (reductionFromParent_.count(st) != 1) {
+  if (reductionBandUpdates_.count(st) != 1) {
     return false;
   }
-  st = reductionFromParent_.at(st);
-  CHECK(reductionBandUpdates_.count(st) == 1);
   // No need to separate if already separated.
   return !reductionBandUpdates_.at(st).separated;
 }
 
 isl::multi_union_pw_aff MappedScop::reductionMapSchedule(
     const detail::ScheduleTree* st) {
-  CHECK(reductionFromParent_.count(st) == 1);
-  auto parent = st;
-  st = reductionFromParent_.at(st);
   CHECK(reductionBandUpdates_.count(st) == 1);
-
   auto reductionBand = st->elemAs<detail::ScheduleTreeElemBand>();
   CHECK(reductionBand);
-  // Start with the schedule of the reduction band (in last position).
-  auto reductionSchedule = reductionBand->mupa_;
 
-  // Total size of returned schedule needs to be equal
-  // to the number of thread identifiers.
-  if (numThreads.view.size() > 1) {
-    CHECK(parent != st);
-  }
-  // Prepend last members of parent band (if any).
-  if (parent != st) {
-    auto parentBand = parent->elemAs<detail::ScheduleTreeElemBand>();
-    CHECK(parentBand);
-    auto parentSchedule = parentBand->mupa_;
-    auto nMember = parentBand->nMember();
-    CHECK_GE(nMember, numThreads.view.size() - 1);
-    parentSchedule = parentSchedule.drop_dims(
-        isl::dim_type::set, 0, nMember - (numThreads.view.size() - 1));
-    reductionSchedule = parentSchedule.flat_range_product(reductionSchedule);
-  }
+  // Drop band members following the reduction dimension and preceding those
+  // mapped to threads.
+  auto reductionSchedule = reductionBand->mupa_;
+  auto nMember = reductionBand->nMember();
+  auto reductionDim = reductionBandUpdates_.at(st).reductionDim;
+  auto nMappedThreads =
+      std::min(numThreads.view.size(), reductionBand->nOuterCoincident() + 1);
+  CHECK_GE(nMember, reductionDim);
+  CHECK_GE(reductionDim + 1, nMappedThreads);
+  reductionSchedule = reductionSchedule.drop_dims(
+      isl::dim_type::set, reductionDim + 1, nMember - reductionDim - 1);
+  reductionSchedule = reductionSchedule.drop_dims(
+      isl::dim_type::set, 0, reductionDim - nMappedThreads + 1);
 
   return reductionSchedule;
 }
 
 detail::ScheduleTree* MappedScop::separateReduction(detail::ScheduleTree* st) {
-  CHECK(reductionFromParent_.count(st) == 1);
-  auto reduction = reductionFromParent_.at(st);
+  auto reduction = st;
   // This function either separates full blocks (if needed) or
   // disables the reduction handling.
   reductionBandUpdates_.at(reduction).separated = true;
@@ -332,7 +317,9 @@ size_t MappedScop::mapToThreads(detail::ScheduleTree* band, size_t nInner) {
   if (nInner >= numThreads.view.size()) {
     return nInner;
   }
-  if (reductionBandUpdates_.count(band) == 1) {
+
+  bool mapReduction = reductionBandUpdates_.count(band) == 1;
+  if (mapReduction) {
     // A reduction is assumed to get mapped to threadIdx.x
     if (nInner != 0) {
       reductionBandUpdates_.erase(band);
@@ -342,7 +329,8 @@ size_t MappedScop::mapToThreads(detail::ScheduleTree* band, size_t nInner) {
     threadIdxxScheduleDepthState.emplace_back(std::make_pair(
         activeDomainPoints(schedule(), band),
         band->scheduleDepth(schedule()) + 0));
-    band = map(band, 0, mapping::ThreadId::x());
+    auto reductionDim = reductionBandUpdates_.at(band).reductionDim;
+    band = map(band, reductionDim, mapping::ThreadId::x());
     markUnroll(scop_->scheduleRoot(), band, unroll);
     return 1;
   }
@@ -582,6 +570,88 @@ std::tuple<std::string, tc::Grid, tc::Block> MappedScop::codegen(
       mappedScopForCodegen->numThreads);
 }
 
+namespace {
+// Move down in the tree starting from the node "tree" until "depth" band
+// members are seen.  Return the band node in which "depth"-th band member is
+// present and its position in that band.  If a node has multiple children,
+// they are assumed to be filter nodes.  Continue in the subtree whose filter
+// has a non-empty intersection with "core", assuming only one such filter is
+// present.
+std::pair<detail::ScheduleTree*, int>
+moveDown(detail::ScheduleTree* tree, int depth, isl::union_set core) {
+  using namespace polyhedral::detail;
+
+  if (auto band = tree->elemAs<ScheduleTreeElemBand>()) {
+    if (band->nMember() > depth) {
+      return std::make_pair(tree, depth);
+    }
+
+    depth -= band->nMember();
+  }
+
+  auto nChildren = tree->numChildren();
+  CHECK(nChildren != 0);
+  if (nChildren == 1) {
+    return moveDown(tree->child({0}), depth, core);
+  }
+
+  size_t targetChild = SIZE_MAX;
+  for (size_t i = 0; i < nChildren; ++i) {
+    auto ch = tree->child({i});
+    auto filter = ch->elemAs<ScheduleTreeElemFilter>();
+    CHECK(filter) << "expected multiple children to be filter nodes, got\n"
+                  << *tree;
+    if (!filter->filter_.intersect(core).is_empty()) {
+      CHECK(targetChild == SIZE_MAX)
+          << "core intersects with more than one child:\n"
+          << *ch << "\n"
+          << *tree->child({targetChild});
+      targetChild = i;
+    }
+  }
+  CHECK(targetChild != SIZE_MAX) << "no children intersect with core " << core;
+
+  return moveDown(tree->child({targetChild}), depth, core);
+}
+} // namespace
+
+// Memory promotion passes happen between reduction detection and this call and
+// they may split bands to insert copies.  The bands with detected reductions
+// may thus become shallower than the recorded reduction member position, that
+// is, this band was split into a deeper band.  Descend in the tree starting
+// from the recorded reduction band until the member is found, split it out
+// into a separate band and introduce synchonization above this band in the
+// tree (synchronization is ordered after all domain elements).  When a tree
+// node has multiple children, descend into the child whose active domain
+// points are a subset of the iteration domain, that is, are not inserted by
+// the memory promotion.  There should be only one such node since the
+// promotion only orders the copies before/after the main computation.
+// Update reductionBandUpdates_ with the newly split-out bands.
+void MappedScop::insertReductionSyncs() {
+  using namespace polyhedral::detail;
+
+  if (reductionBandUpdates_.size() == 0) {
+    return;
+  }
+
+  std::map<const ScheduleTree*, Reduction> reductionUpdates;
+  for (auto bandUpdate : reductionBandUpdates_) {
+    ScheduleTree* tree;
+    int position;
+    std::tie(tree, position) = moveDown(
+        const_cast<ScheduleTree*>(bandUpdate.first),
+        bandUpdate.second.reductionDim,
+        scop_->domain());
+    reductionUpdates.emplace(tree, bandUpdate.second);
+
+    tree = bandSplitOut(scop_->scheduleRoot(), tree, position);
+    for (auto updateId : bandUpdate.second.ids) {
+      scop_->insertReductionSync1D(tree, updateId);
+    }
+  }
+  reductionBandUpdates_ = reductionUpdates;
+}
+
 std::unique_ptr<MappedScop> MappedScop::makeWithOuterBlockInnerThreadStrategy(
     std::unique_ptr<Scop>&& scopUPtr,
     const CudaMappingOptions& cudaOptions) {
@@ -701,13 +771,10 @@ std::unique_ptr<MappedScop> MappedScop::makeWithOuterBlockInnerThreadStrategy(
   // 9. Insert mapping context
   mappedScop->insertMappingContext();
 
-  // 10. Optionally insert reduction synchronizations
-  for (auto bandUpdate : mappedScop->reductionBandUpdates_) {
-    for (auto updateId : bandUpdate.second.ids) {
-      scop->insertReductionSync1D(
-          const_cast<ScheduleTree*>(bandUpdate.first), updateId);
-    }
-  }
+  // 10. Insert reduction synchronizations if necessary and update
+  // reductionBandUpdates_ to contain the bands that may have been split out in
+  // previous steps.
+  mappedScop->insertReductionSyncs();
   LOG_IF(INFO, FLAGS_debug_tc_mapper)
       << "After inserting reduction synchronization:" << std::endl
       << *mappedScop->schedule();
